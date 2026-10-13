@@ -43,6 +43,11 @@ cargo test
 2. Press **Start** (or the global hotkey) — clicks begin at the current cursor position.
 3. Press **Stop** (or the hotkey again) to halt instantly.
 
+## Performance
+
+- Windows quantizes blocking waits to the 15.6 ms system timer quantum, which caps naive implementations at ~64 CPS. QAutoClick raises the timer resolution to 1 ms (`timeBeginPeriod`) while clicking and finishes every wait with a busy-poll phase, so sub-millisecond intervals actually deliver sub-millisecond pacing.
+- Pacing is fixed-rate: if a click takes longer than the configured interval, the engine clicks back-to-back (the practical ceiling). The engine loop itself sustains ~1M CPS with a no-op clicker (`cargo test --release engine_ceiling -- --ignored --nocapture`); with real `SendInput` clicks the ceiling is tens of thousands of CPS, far beyond what games (which sample input once per frame) can register.
+
 ## License
 
 See [LICENSE](LICENSE).

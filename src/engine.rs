@@ -1,9 +1,18 @@
-use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, TryRecvError};
+use std::time::Instant;
 
 use enigo::{Button, Direction, Enigo, Mouse as _, Settings};
 
 use crate::commands::{EngineCommand, EngineStatus};
 use crate::config::{ClickerConfig, CountMode, MouseChoice};
+
+/// Waiting past this point happens on a busy spin so sub-millisecond targets
+/// are not quantized to the OS timer quantum.
+const SPIN_THRESHOLD: std::time::Duration = std::time::Duration::from_millis(2);
+
+/// Safety margin subtracted from blocking waits so control lands in the spin
+/// phase before the target time (blocking waits round up to the OS quantum).
+const SLEEP_MARGIN: std::time::Duration = std::time::Duration::from_millis(1);
 
 /// Abstract click source so the engine can be tested without touching the OS.
 pub trait Clicker: Send {
@@ -37,11 +46,62 @@ impl Clicker for EnigoClicker {
 /// Creates clickers on demand; injectable for tests.
 pub type ClickerFactory = Box<dyn FnMut() -> Result<Box<dyn Clicker>, String> + Send>;
 
-/// Engine thread body. Blocks until `EngineCommand::Shutdown` or channel disconnect.
+/// Outcome of waiting for the next click time.
+enum Wait {
+    /// Target time reached: perform a click.
+    Proceed,
+    /// A command arrived before the target time.
+    Command(EngineCommand),
+    /// Command channel closed: GUI is gone.
+    Disconnected,
+}
+
+/// Windows quantizes blocking waits (sleep, recv_timeout) to the system timer
+/// quantum — 15.6 ms by default, which caps the clicker at ~64 CPS. Raise the
+/// resolution to 1 ms while the engine is clicking; undo it when it stops.
+#[cfg(target_os = "windows")]
+fn timer_resolution(active: bool) {
+    use windows_sys::Win32::Media::{timeBeginPeriod, timeEndPeriod};
+    unsafe {
+        if active {
+            timeBeginPeriod(1);
+        } else {
+            timeEndPeriod(1);
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn timer_resolution(_active: bool) {}
+
+/// Wait until `target`, staying responsive to commands the whole time.
 ///
-/// While running, clicks are paced by waiting on the command channel with the
-/// configured interval as timeout: a timeout means "time to click", any incoming
-/// command (e.g. Stop) is handled instantly without waiting out the interval.
+/// While more than `SPIN_THRESHOLD` remains, block on the command channel
+/// (zero CPU cost). The final stretch busy-polls the channel: the target time
+/// is hit with sub-millisecond precision and Stop/SetConfig stay instant.
+fn wait_for_target(cmd_rx: &Receiver<EngineCommand>, target: Instant) -> Wait {
+    loop {
+        let now = Instant::now();
+        if now >= target {
+            return Wait::Proceed;
+        }
+        let remaining = target - now;
+        if remaining > SPIN_THRESHOLD {
+            match cmd_rx.recv_timeout(remaining - SLEEP_MARGIN) {
+                Ok(cmd) => return Wait::Command(cmd),
+                Err(RecvTimeoutError::Timeout) => continue,
+                Err(RecvTimeoutError::Disconnected) => return Wait::Disconnected,
+            }
+        }
+        match cmd_rx.try_recv() {
+            Ok(cmd) => return Wait::Command(cmd),
+            Err(TryRecvError::Disconnected) => return Wait::Disconnected,
+            Err(TryRecvError::Empty) => std::hint::spin_loop(),
+        }
+    }
+}
+
+/// Engine thread body. Blocks until `EngineCommand::Shutdown` or channel disconnect.
 pub fn run(
     mut clicker_factory: ClickerFactory,
     cmd_rx: Receiver<EngineCommand>,
@@ -52,6 +112,8 @@ pub fn run(
     let mut clicker: Option<Box<dyn Clicker>> = None;
     let mut running = false;
     let mut clicks_done: u64 = 0;
+    // Next scheduled click time; meaningful only while running.
+    let mut next_click_at = Instant::now();
 
     let mut set_clicker = |clicker: &mut Option<Box<dyn Clicker>>| -> Result<(), String> {
         if clicker.is_none() {
@@ -70,6 +132,8 @@ pub fn run(
                     }
                     clicks_done = 0;
                     running = true;
+                    timer_resolution(true);
+                    next_click_at = Instant::now() + config.interval();
                     let _ = status_tx.send(EngineStatus::Running { clicks_done });
                 }
                 Ok(EngineCommand::SetConfig(new_config)) => config = new_config,
@@ -77,33 +141,40 @@ pub fn run(
                 Ok(EngineCommand::Stop) => {}
             }
         } else {
-            let timeout = config.interval();
-            match cmd_rx.recv_timeout(timeout) {
-                Ok(EngineCommand::Stop) | Err(RecvTimeoutError::Disconnected) => {
+            match wait_for_target(&cmd_rx, next_click_at) {
+                Wait::Command(EngineCommand::Stop) | Wait::Disconnected => {
                     running = false;
+                    timer_resolution(false);
                     let _ = status_tx.send(EngineStatus::Idle);
                 }
-                Ok(EngineCommand::Shutdown) => break,
-                Ok(EngineCommand::SetConfig(new_config)) => config = new_config,
-                Ok(EngineCommand::Start) => {
+                Wait::Command(EngineCommand::Shutdown) => break,
+                Wait::Command(EngineCommand::SetConfig(new_config)) => config = new_config,
+                Wait::Command(EngineCommand::Start) => {
                     clicks_done = 0;
+                    next_click_at = Instant::now() + config.interval();
                     let _ = status_tx.send(EngineStatus::Running { clicks_done });
                 }
-                Err(RecvTimeoutError::Timeout) => {
+                Wait::Proceed => {
                     let backend = clicker.as_mut().expect("clicker exists while running");
                     match backend.click(config.button) {
                         Ok(()) => {
                             clicks_done += 1;
+                            // Fixed-rate scheduling: if a click takes longer than
+                            // the interval, the next target is already due and the
+                            // engine clicks back-to-back (the practical ceiling).
+                            next_click_at += config.interval();
                             let _ = status_tx.send(EngineStatus::Running { clicks_done });
                             if let CountMode::Fixed(limit) = config.count_mode {
                                 if clicks_done >= u64::from(limit) {
                                     running = false;
+                                    timer_resolution(false);
                                     let _ = status_tx.send(EngineStatus::Idle);
                                 }
                             }
                         }
                         Err(e) => {
                             running = false;
+                            timer_resolution(false);
                             // Drop the backend so the next Start re-initializes it.
                             clicker = None;
                             let _ = status_tx.send(EngineStatus::Error(e));
@@ -256,6 +327,72 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(5);
         wait_for_status(&status_rx, deadline, |s| *s == EngineStatus::Idle);
         assert_eq!(counter.load(Ordering::SeqCst), 2);
+
+        cmd_tx.send(EngineCommand::Shutdown).unwrap();
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn sub_millisecond_interval_reaches_thousands_of_cps() {
+        let counter = Arc::new(AtomicU64::new(0));
+        let mut config = fast_config();
+        config.interval_ms = 0.1;
+        config.count_mode = CountMode::Fixed(2000);
+        let (cmd_tx, status_rx, handle) = spawn_engine(fake_factory(counter.clone(), false), config);
+
+        let started = Instant::now();
+        cmd_tx.send(EngineCommand::Start).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            assert!(Instant::now() < deadline, "timed out waiting for Idle");
+            match status_rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(EngineStatus::Idle) => break,
+                Ok(_) => {}
+                Err(RecvTimeoutError::Timeout) => continue,
+                Err(e) => panic!("status channel error: {e}"),
+            }
+        }
+        let elapsed = started.elapsed();
+        assert_eq!(counter.load(Ordering::SeqCst), 2000);
+        // Without high-resolution pacing this run takes ~31 s (2000 x 15.6 ms quantum).
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "2000 clicks at 0.1 ms took {elapsed:?} — waits are quantized again"
+        );
+        let cps = 2000.0 / elapsed.as_secs_f64();
+        assert!(cps > 1000.0, "expected >1000 CPS, got {cps:.0}");
+
+        cmd_tx.send(EngineCommand::Shutdown).unwrap();
+        handle.join().unwrap();
+    }
+
+    /// Manual benchmark of the engine loop ceiling with a no-op clicker:
+    /// `cargo test --release engine_ceiling -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "benchmark, run manually"]
+    fn engine_ceiling_benchmark() {
+        let counter = Arc::new(AtomicU64::new(0));
+        let mut config = fast_config();
+        config.interval_ms = 0.001;
+        config.count_mode = CountMode::Fixed(100_000);
+        let (cmd_tx, status_rx, handle) = spawn_engine(fake_factory(counter.clone(), false), config);
+
+        let started = Instant::now();
+        cmd_tx.send(EngineCommand::Start).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            assert!(Instant::now() < deadline, "timed out waiting for Idle");
+            match status_rx.recv_timeout(Duration::from_millis(200)) {
+                Ok(EngineStatus::Idle) => break,
+                Ok(_) => {}
+                Err(RecvTimeoutError::Timeout) => continue,
+                Err(e) => panic!("status channel error: {e}"),
+            }
+        }
+        let elapsed = started.elapsed();
+        let cps = 100_000.0 / elapsed.as_secs_f64();
+        println!("engine ceiling: 100000 clicks in {elapsed:.3?} -> {cps:.0} CPS");
+        assert_eq!(counter.load(Ordering::SeqCst), 100_000);
 
         cmd_tx.send(EngineCommand::Shutdown).unwrap();
         handle.join().unwrap();

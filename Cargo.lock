@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "QAutoClick"
-version = "0.1.0-alpha.2"
+version = "0.1.0-alpha.3"
 dependencies = [
  "dirs",
  "eframe",
@@ -12,6 +12,7 @@ dependencies = [
  "global-hotkey",
  "serde",
  "serde_json",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
