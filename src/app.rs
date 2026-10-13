@@ -321,6 +321,54 @@ impl eframe::App for QAutoClickApp {
                 });
                 ui.end_row();
 
+                ui.label("Floating delay");
+                ui.horizontal(|ui| {
+                    let mut enabled = self.config.jitter.enabled;
+                    if ui.checkbox(&mut enabled, "").changed() {
+                        self.config.jitter.enabled = enabled;
+                        self.on_config_changed();
+                    }
+                    if self.config.jitter.enabled {
+                        ui.weak("-");
+                        if ui
+                            .add(
+                                egui::DragValue::new(&mut self.config.jitter.offset_minus_ms)
+                                    .range(0.0..=3_600_000.0)
+                                    .speed(1)
+                                    .suffix(" ms"),
+                            )
+                            .changed()
+                        {
+                            self.on_config_changed();
+                        }
+                        ui.weak("+");
+                        if ui
+                            .add(
+                                egui::DragValue::new(&mut self.config.jitter.offset_plus_ms)
+                                    .range(0.0..=3_600_000.0)
+                                    .speed(1)
+                                    .suffix(" ms"),
+                            )
+                            .changed()
+                        {
+                            self.on_config_changed();
+                        }
+                        ui.weak("speed");
+                        if ui
+                            .add(
+                                egui::DragValue::new(&mut self.config.jitter.change_speed_ms_per_s)
+                                    .range(0.0..=3_600_000.0)
+                                    .speed(1)
+                                    .suffix(" ms/s"),
+                            )
+                            .changed()
+                        {
+                            self.on_config_changed();
+                        }
+                    }
+                });
+                ui.end_row();
+
                 ui.label("Toggle hotkey");
                 ui.horizontal(|ui| {
                     let binding = self.binder.is_some();

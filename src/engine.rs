@@ -46,6 +46,44 @@ impl Clicker for EnigoClicker {
 /// Creates clickers on demand; injectable for tests.
 pub type ClickerFactory = Box<dyn FnMut() -> Result<Box<dyn Clicker>, String> + Send>;
 
+/// Random target for the floating delay: somewhere in
+/// `[base - offset_minus, base + offset_plus]`, never below 0.001 ms.
+fn next_jitter_target(config: &ClickerConfig) -> f64 {
+    let jitter = &config.jitter;
+    let span = jitter.offset_minus_ms + jitter.offset_plus_ms;
+    (config.interval_ms - jitter.offset_minus_ms + fastrand::f64() * span).max(0.001)
+}
+
+/// Drifting state of the floating delay for one run.
+struct JitterRuntime {
+    current: f64,
+    target: f64,
+}
+
+impl JitterRuntime {
+    fn new(config: &ClickerConfig) -> Self {
+        Self {
+            current: config.interval_ms,
+            target: next_jitter_target(config),
+        }
+    }
+
+    /// Advance the drift by the time spent since the previous click and
+    /// return the interval to use for scheduling the next one.
+    fn interval_for_next_click(&mut self, config: &ClickerConfig, dt: std::time::Duration) -> f64 {
+        let step = config.jitter.change_speed_ms_per_s.max(0.0) * dt.as_secs_f64();
+        let diff = self.target - self.current;
+        if diff.abs() <= step {
+            // Target reached: schedule with it and roll a new one.
+            self.current = self.target;
+            self.target = next_jitter_target(config);
+        } else {
+            self.current += diff.signum() * step;
+        }
+        self.current.max(0.001)
+    }
+}
+
 /// Outcome of waiting for the next click time.
 enum Wait {
     /// Target time reached: perform a click.
@@ -114,6 +152,18 @@ pub fn run(
     let mut clicks_done: u64 = 0;
     // Next scheduled click time; meaningful only while running.
     let mut next_click_at = Instant::now();
+    // Floating delay state: Some while the run has jitter enabled.
+    let mut jitter: Option<JitterRuntime> = None;
+    // When the interval of the previous click was scheduled.
+    let mut last_scheduled_at = Instant::now();
+
+    let start_run = |config: &ClickerConfig| -> Option<JitterRuntime> {
+        if config.jitter.enabled {
+            Some(JitterRuntime::new(config))
+        } else {
+            None
+        }
+    };
 
     let mut set_clicker = |clicker: &mut Option<Box<dyn Clicker>>| -> Result<(), String> {
         if clicker.is_none() {
@@ -134,9 +184,17 @@ pub fn run(
                     running = true;
                     timer_resolution(true);
                     next_click_at = Instant::now() + config.interval();
+                    last_scheduled_at = Instant::now();
+                    jitter = start_run(&config);
                     let _ = status_tx.send(EngineStatus::Running { clicks_done });
                 }
-                Ok(EngineCommand::SetConfig(new_config)) => config = new_config,
+                Ok(EngineCommand::SetConfig(new_config)) => {
+                    // (Re-)initialize the drift when the feature is toggled mid-run.
+                    if running && new_config.jitter.enabled != config.jitter.enabled {
+                        jitter = start_run(&new_config);
+                    }
+                    config = new_config;
+                }
                 Ok(EngineCommand::Shutdown) | Err(_) => break,
                 Ok(EngineCommand::Stop) => {}
             }
@@ -148,21 +206,31 @@ pub fn run(
                     let _ = status_tx.send(EngineStatus::Idle);
                 }
                 Wait::Command(EngineCommand::Shutdown) => break,
-                Wait::Command(EngineCommand::SetConfig(new_config)) => config = new_config,
+                Wait::Command(EngineCommand::SetConfig(new_config)) => {
+                    if new_config.jitter.enabled != config.jitter.enabled {
+                        jitter = start_run(&new_config);
+                    }
+                    config = new_config;
+                }
                 Wait::Command(EngineCommand::Start) => {
                     clicks_done = 0;
                     next_click_at = Instant::now() + config.interval();
+                    last_scheduled_at = Instant::now();
+                    jitter = start_run(&config);
                     let _ = status_tx.send(EngineStatus::Running { clicks_done });
                 }
                 Wait::Proceed => {
+                    let now = Instant::now();
+                    let used_ms = match &mut jitter {
+                        Some(state) => state.interval_for_next_click(&config, now - last_scheduled_at),
+                        None => config.interval_ms,
+                    };
+                    next_click_at += std::time::Duration::from_secs_f64(used_ms.max(0.001) / 1000.0);
+                    last_scheduled_at = now;
                     let backend = clicker.as_mut().expect("clicker exists while running");
                     match backend.click(config.button) {
                         Ok(()) => {
                             clicks_done += 1;
-                            // Fixed-rate scheduling: if a click takes longer than
-                            // the interval, the next target is already due and the
-                            // engine clicks back-to-back (the practical ceiling).
-                            next_click_at += config.interval();
                             let _ = status_tx.send(EngineStatus::Running { clicks_done });
                             if let CountMode::Fixed(limit) = config.count_mode {
                                 if clicks_done >= u64::from(limit) {
@@ -189,6 +257,7 @@ pub fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::JitterConfig;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc;
     use std::thread;
@@ -315,6 +384,48 @@ mod tests {
     }
 
     #[test]
+    fn jitter_targets_stay_within_offsets() {
+        let mut config = fast_config();
+        config.interval_ms = 50.0;
+        config.jitter = JitterConfig {
+            enabled: true,
+            offset_minus_ms: 20.0,
+            offset_plus_ms: 5.0,
+            change_speed_ms_per_s: 100.0,
+        };
+        for _ in 0..10_000 {
+            let target = next_jitter_target(&config);
+            assert!(
+                (30.0..=55.0).contains(&target),
+                "target {target} outside [base-minus, base+plus]"
+            );
+        }
+    }
+
+    #[test]
+    fn jitter_drifts_toward_target_at_configured_speed() {
+        let mut config = fast_config();
+        config.jitter = JitterConfig {
+            enabled: true,
+            offset_minus_ms: 100.0,
+            offset_plus_ms: 100.0,
+            change_speed_ms_per_s: 100.0,
+        };
+        let mut state = JitterRuntime::new(&config);
+        state.current = 100.0;
+        state.target = 110.0;
+
+        // 100 ms/s means 5 ms of drift per 0.05 s tick: 100 -> 105.
+        let used = state.interval_for_next_click(&config, Duration::from_millis(50));
+        assert_eq!(used, 105.0);
+        // Remaining 5 ms are covered by a 0.05 s tick (step = 5 ms): 105 -> 110.
+        let used = state.interval_for_next_click(&config, Duration::from_millis(50));
+        assert_eq!(used, 110.0);
+        // Target reached: a new one has been rolled within the offsets.
+        assert!((0.001..=200.0).contains(&state.target));
+    }
+
+    #[test]
     fn set_config_while_idle_applies_to_next_run() {
         let counter = Arc::new(AtomicU64::new(0));
         let (cmd_tx, status_rx, handle) = spawn_engine(fake_factory(counter.clone(), false), fast_config());
@@ -366,12 +477,51 @@ mod tests {
         handle.join().unwrap();
     }
 
+    #[test]
+    fn floating_delay_drifts_the_interval_between_clicks() {
+        let counter = Arc::new(AtomicU64::new(0));
+        let mut config = fast_config();
+        config.interval_ms = 10.0;
+        config.jitter = JitterConfig {
+            enabled: true,
+            // Targets wander in [1, 10] ms — average well below the 10 ms base.
+            offset_minus_ms: 9.0,
+            offset_plus_ms: 0.0,
+            change_speed_ms_per_s: 10_000.0,
+        };
+        config.count_mode = CountMode::Fixed(200);
+        let (cmd_tx, status_rx, handle) = spawn_engine(fake_factory(counter.clone(), false), config);
+
+        let started = Instant::now();
+        cmd_tx.send(EngineCommand::Start).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            assert!(Instant::now() < deadline, "timed out waiting for Idle");
+            match status_rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(EngineStatus::Idle) => break,
+                Ok(_) => {}
+                Err(RecvTimeoutError::Timeout) => continue,
+                Err(e) => panic!("status channel error: {e}"),
+            }
+        }
+        let elapsed = started.elapsed();
+        assert_eq!(counter.load(Ordering::SeqCst), 200);
+        // With the base interval alone this run needs >= 2 s; drifting to
+        // [1, 10] ms targets averages roughly half of that.
+        assert!(
+            elapsed < Duration::from_millis(1700),
+            "200 clicks took {elapsed:?} — the floating delay had no effect"
+        );
+
+        cmd_tx.send(EngineCommand::Shutdown).unwrap();
+        handle.join().unwrap();
+    }
+
     /// Manual benchmark of the engine loop ceiling with a no-op clicker:
     /// `cargo test --release engine_ceiling -- --ignored --nocapture`.
     #[test]
     #[ignore = "benchmark, run manually"]
-    fn engine_ceiling_benchmark() {
-        let counter = Arc::new(AtomicU64::new(0));
+    fn engine_ceiling_benchmark() {        let counter = Arc::new(AtomicU64::new(0));
         let mut config = fast_config();
         config.interval_ms = 0.001;
         config.count_mode = CountMode::Fixed(100_000);

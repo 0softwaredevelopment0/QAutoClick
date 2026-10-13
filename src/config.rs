@@ -22,6 +22,42 @@ pub enum CountMode {
     Fixed(u32),
 }
 
+/// Floating (jitter) delay: the interval smoothly drifts toward a random
+/// target within `[base - offset_minus_ms, base + offset_plus_ms]`,
+/// changing at `change_speed_ms_per_s`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "snake_case")]
+pub struct JitterConfig {
+    /// Whether the floating delay is active.
+    pub enabled: bool,
+    /// Maximum deviation below the base interval, ms.
+    pub offset_minus_ms: f64,
+    /// Maximum deviation above the base interval, ms.
+    pub offset_plus_ms: f64,
+    /// How fast the interval drifts toward its random target, ms per second.
+    pub change_speed_ms_per_s: f64,
+}
+
+impl Default for JitterConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            offset_minus_ms: 5.0,
+            offset_plus_ms: 5.0,
+            change_speed_ms_per_s: 50.0,
+        }
+    }
+}
+
+impl JitterConfig {
+    fn sanitized(mut self) -> Self {
+        self.offset_minus_ms = self.offset_minus_ms.clamp(0.0, 3_600_000.0);
+        self.offset_plus_ms = self.offset_plus_ms.clamp(0.0, 3_600_000.0);
+        self.change_speed_ms_per_s = self.change_speed_ms_per_s.clamp(0.0, 3_600_000.0);
+        self
+    }
+}
+
 /// User-facing clicker settings, persisted as JSON.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "snake_case")]
@@ -36,6 +72,8 @@ pub struct ClickerConfig {
     /// Global toggle hotkey as a `keyboard_types::Code` name, e.g. "F6", "KeyA", "Space".
     #[serde(default = "default_hotkey_code")]
     pub hotkey_code: String,
+    /// Floating delay (jitter) settings.
+    pub jitter: JitterConfig,
 }
 
 fn default_interval_ms() -> f64 {
@@ -53,6 +91,7 @@ impl Default for ClickerConfig {
             button: MouseChoice::Left,
             count_mode: CountMode::Infinite,
             hotkey_code: default_hotkey_code(),
+            jitter: JitterConfig::default(),
         }
     }
 }
@@ -71,6 +110,7 @@ impl ClickerConfig {
         if let CountMode::Fixed(0) = self.count_mode {
             self.count_mode = CountMode::Infinite;
         }
+        self.jitter = self.jitter.sanitized();
         self
     }
 
@@ -116,10 +156,16 @@ mod tests {
     #[test]
     fn serde_round_trip_preserves_values() {
         let config = ClickerConfig {
-            interval_ms: 0.5,
+            interval_ms: 42.0,
             button: MouseChoice::Right,
             count_mode: CountMode::Fixed(100),
             hotkey_code: "KeyX".to_owned(),
+            jitter: JitterConfig {
+                enabled: true,
+                offset_minus_ms: 3.0,
+                offset_plus_ms: 7.0,
+                change_speed_ms_per_s: 25.0,
+            },
         };
         let text = serde_json::to_string(&config).unwrap();
         let parsed: ClickerConfig = serde_json::from_str(&text).unwrap();
@@ -167,5 +213,33 @@ mod tests {
         let mut config = ClickerConfig::default();
         config.interval_ms = 0.5;
         assert_eq!(config.interval(), std::time::Duration::from_micros(500));
+    }
+
+    #[test]
+    fn jitter_survives_round_trip_and_sanitizes_offsets() {
+        let mut config = ClickerConfig::default();
+        config.jitter = JitterConfig {
+            enabled: true,
+            offset_minus_ms: -3.0,
+            offset_plus_ms: 8.0,
+            change_speed_ms_per_s: -10.0,
+        };
+        let text = serde_json::to_string(&config).unwrap();
+        let mut parsed: ClickerConfig = serde_json::from_str(&text).unwrap();
+        assert!(parsed.jitter.enabled);
+        parsed.jitter = parsed.jitter.sanitized();
+        assert_eq!(parsed.jitter.offset_minus_ms, 0.0);
+        assert_eq!(parsed.jitter.offset_plus_ms, 8.0);
+        assert_eq!(parsed.jitter.change_speed_ms_per_s, 0.0);
+    }
+
+    #[test]
+    fn old_config_without_jitter_loads_with_defaults() {
+        let old = r#"{"interval_ms": 100}"#;
+        let parsed: ClickerConfig = serde_json::from_str(old).unwrap();
+        assert!(!parsed.jitter.enabled);
+        assert_eq!(parsed.jitter.offset_minus_ms, 5.0);
+        assert_eq!(parsed.jitter.offset_plus_ms, 5.0);
+        assert_eq!(parsed.jitter.change_speed_ms_per_s, 50.0);
     }
 }

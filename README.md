@@ -7,6 +7,7 @@ QAutoClick is a flexible and fast desktop auto-clicker for a variety of purposes
 - **Configurable interval** — delay between clicks from fractions of a millisecond upward, with a live clicks-per-second estimate (intervals below 1 ms trigger a CPU-load warning)
 - **Mouse button choice** — left, middle or right click
 - **Click count modes** — click infinitely or stop automatically after N clicks
+- **Floating delay (jitter)** — optional smooth drift of the interval between random targets within `base − X … base + Y` ms at a configurable speed (ms/s), with separate negative and positive offsets
 - **Global hotkey** — start/stop from any application, even when the window is minimized; bind **any keyboard key** via the Bind button (press it within 5 seconds, otherwise binding is cancelled)
 - **Live config** — every change applies instantly and is saved to disk
 - **Profiles on disk** — settings persist in `<config_dir>/QAutoClick/config.json` (e.g. `%APPDATA%\QAutoClick\config.json` on Windows)
