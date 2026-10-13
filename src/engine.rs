@@ -1,5 +1,4 @@
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
-use std::time::Duration;
 
 use enigo::{Button, Direction, Enigo, Mouse as _, Settings};
 
@@ -78,7 +77,7 @@ pub fn run(
                 Ok(EngineCommand::Stop) => {}
             }
         } else {
-            let timeout = Duration::from_millis(config.interval_ms);
+            let timeout = config.interval();
             match cmd_rx.recv_timeout(timeout) {
                 Ok(EngineCommand::Stop) | Err(RecvTimeoutError::Disconnected) => {
                     running = false;
@@ -122,7 +121,7 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc;
     use std::thread;
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
 
     struct FakeClicker {
         counter: Arc<AtomicU64>,
@@ -151,7 +150,7 @@ mod tests {
 
     fn fast_config() -> ClickerConfig {
         ClickerConfig {
-            interval_ms: 5,
+            interval_ms: 5.0,
             ..ClickerConfig::default()
         }
     }
@@ -210,7 +209,7 @@ mod tests {
     fn stop_is_instant_even_with_huge_interval() {
         let counter = Arc::new(AtomicU64::new(0));
         let mut config = fast_config();
-        config.interval_ms = 10_000;
+        config.interval_ms = 10_000.0;
         let (cmd_tx, status_rx, handle) = spawn_engine(fake_factory(counter.clone(), false), config);
 
         cmd_tx.send(EngineCommand::Start).unwrap();

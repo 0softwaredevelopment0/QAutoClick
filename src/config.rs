@@ -1,3 +1,6 @@
+use std::str::FromStr;
+
+use global_hotkey::hotkey::Code;
 use serde::{Deserialize, Serialize};
 
 /// Which mouse button the engine presses.
@@ -20,27 +23,27 @@ pub enum CountMode {
 }
 
 /// User-facing clicker settings, persisted as JSON.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "snake_case")]
 pub struct ClickerConfig {
-    /// Delay between clicks in milliseconds.
+    /// Delay between clicks in milliseconds; may be fractional (sub-millisecond allowed).
     #[serde(default = "default_interval_ms")]
-    pub interval_ms: u64,
+    pub interval_ms: f64,
     /// Mouse button to press.
     pub button: MouseChoice,
     /// Clicks per run.
     pub count_mode: CountMode,
-    /// Function key (1-12) used as the global start/stop hotkey (F-key).
-    #[serde(default = "default_hotkey_fkey")]
-    pub hotkey_fkey: u8,
+    /// Global toggle hotkey as a `keyboard_types::Code` name, e.g. "F6", "KeyA", "Space".
+    #[serde(default = "default_hotkey_code")]
+    pub hotkey_code: String,
 }
 
-fn default_interval_ms() -> u64 {
-    100
+fn default_interval_ms() -> f64 {
+    100.0
 }
 
-fn default_hotkey_fkey() -> u8 {
-    6
+fn default_hotkey_code() -> String {
+    "F6".to_owned()
 }
 
 impl Default for ClickerConfig {
@@ -49,7 +52,7 @@ impl Default for ClickerConfig {
             interval_ms: default_interval_ms(),
             button: MouseChoice::Left,
             count_mode: CountMode::Infinite,
-            hotkey_fkey: default_hotkey_fkey(),
+            hotkey_code: default_hotkey_code(),
         }
     }
 }
@@ -57,16 +60,23 @@ impl Default for ClickerConfig {
 impl ClickerConfig {
     /// Clamp values coming from an untrusted/old config file into valid ranges.
     pub fn sanitized(mut self) -> Self {
-        self.interval_ms = self.interval_ms.clamp(1, 3_600_000);
-        self.hotkey_fkey = if (1..=12).contains(&self.hotkey_fkey) {
-            self.hotkey_fkey
+        self.interval_ms = if self.interval_ms.is_finite() && self.interval_ms > 0.0 {
+            self.interval_ms.min(3_600_000.0)
         } else {
-            6
+            default_interval_ms()
         };
+        if Code::from_str(&self.hotkey_code).is_err() {
+            self.hotkey_code = default_hotkey_code();
+        }
         if let CountMode::Fixed(0) = self.count_mode {
             self.count_mode = CountMode::Infinite;
         }
         self
+    }
+
+    /// Delay as a `Duration`, safe to hand to the engine (always > 0).
+    pub fn interval(&self) -> std::time::Duration {
+        std::time::Duration::from_secs_f64(self.interval_ms / 1000.0)
     }
 
     /// Default config file path: `<config_dir>/QAutoClick/config.json`.
@@ -106,10 +116,10 @@ mod tests {
     #[test]
     fn serde_round_trip_preserves_values() {
         let config = ClickerConfig {
-            interval_ms: 42,
+            interval_ms: 0.5,
             button: MouseChoice::Right,
             count_mode: CountMode::Fixed(100),
-            hotkey_fkey: 7,
+            hotkey_code: "KeyX".to_owned(),
         };
         let text = serde_json::to_string(&config).unwrap();
         let parsed: ClickerConfig = serde_json::from_str(&text).unwrap();
@@ -117,33 +127,45 @@ mod tests {
     }
 
     #[test]
-    fn load_falls_back_to_default_on_garbage() {
-        // Simulate the load path by parsing garbage the same way load() does.
-        let parsed: Option<ClickerConfig> = serde_json::from_str("{not json").ok();
-        assert!(parsed.is_none());
-        assert_eq!(ClickerConfig::default(), ClickerConfig::default());
-    }
-
-    #[test]
-    fn sanitized_fixes_out_of_range_values() {
-        let config = ClickerConfig {
-            interval_ms: 0,
-            button: MouseChoice::Left,
-            count_mode: CountMode::Fixed(0),
-            hotkey_fkey: 99,
-        };
+    fn sanitized_keeps_sub_millisecond_but_fixes_non_positive() {
+        let mut config = ClickerConfig::default();
+        config.interval_ms = 0.25;
+        config.hotkey_code = "NotAKey".to_owned();
+        config.count_mode = CountMode::Fixed(0);
         let fixed = config.sanitized();
-        assert_eq!(fixed.interval_ms, 1);
-        assert_eq!(fixed.hotkey_fkey, 6);
+        assert_eq!(fixed.interval_ms, 0.25);
+        assert_eq!(fixed.hotkey_code, "F6");
         assert_eq!(fixed.count_mode, CountMode::Infinite);
+
+        for bad in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            let mut config = ClickerConfig::default();
+            config.interval_ms = bad;
+            assert_eq!(config.sanitized().interval_ms, default_interval_ms());
+        }
     }
 
     #[test]
     fn deserializing_partial_json_fills_defaults() {
         let parsed: ClickerConfig = serde_json::from_str(r#"{"interval_ms": 250}"#).unwrap();
-        assert_eq!(parsed.interval_ms, 250);
+        assert_eq!(parsed.interval_ms, 250.0);
         assert_eq!(parsed.button, MouseChoice::Left);
         assert_eq!(parsed.count_mode, CountMode::Infinite);
-        assert_eq!(parsed.hotkey_fkey, 6);
+        assert_eq!(parsed.hotkey_code, "F6");
+    }
+
+    #[test]
+    fn old_config_without_hotkey_code_still_loads() {
+        // Configs from versions that stored an F-key index instead of a key code.
+        let old = r#"{"interval_ms": 50, "button": "Left", "count_mode": "Infinite", "hotkey_fkey": 8}"#;
+        let parsed: ClickerConfig = serde_json::from_str(old).unwrap();
+        assert_eq!(parsed.interval_ms, 50.0);
+        assert_eq!(parsed.hotkey_code, "F6");
+    }
+
+    #[test]
+    fn interval_converts_to_positive_duration() {
+        let mut config = ClickerConfig::default();
+        config.interval_ms = 0.5;
+        assert_eq!(config.interval(), std::time::Duration::from_micros(500));
     }
 }

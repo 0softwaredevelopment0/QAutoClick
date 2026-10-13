@@ -1,8 +1,9 @@
+use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::Arc;
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use eframe::egui;
 use global_hotkey::hotkey::{Code, HotKey};
@@ -10,6 +11,49 @@ use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
 
 use crate::commands::{EngineCommand, EngineStatus};
 use crate::config::{ClickerConfig, CountMode, MouseChoice};
+
+/// How long the "press any key" bind window stays open.
+const BIND_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Keys offered for binding: everything people plausibly use as a clicker hotkey.
+/// Keys the OS refuses to register are silently skipped; Power/Sleep and
+/// keyboard-internal keys are excluded on purpose.
+const BINDABLE_CODES: &[Code] = &[
+    Code::F1, Code::F2, Code::F3, Code::F4, Code::F5, Code::F6, Code::F7, Code::F8, Code::F9,
+    Code::F10, Code::F11, Code::F12, Code::F13, Code::F14, Code::F15, Code::F16, Code::F17,
+    Code::F18, Code::F19, Code::F20, Code::F21, Code::F22, Code::F23, Code::F24,
+    Code::KeyA, Code::KeyB, Code::KeyC, Code::KeyD, Code::KeyE, Code::KeyF, Code::KeyG,
+    Code::KeyH, Code::KeyI, Code::KeyJ, Code::KeyK, Code::KeyL, Code::KeyM, Code::KeyN,
+    Code::KeyO, Code::KeyP, Code::KeyQ, Code::KeyR, Code::KeyS, Code::KeyT, Code::KeyU,
+    Code::KeyV, Code::KeyW, Code::KeyX, Code::KeyY, Code::KeyZ,
+    Code::Digit0, Code::Digit1, Code::Digit2, Code::Digit3, Code::Digit4, Code::Digit5,
+    Code::Digit6, Code::Digit7, Code::Digit8, Code::Digit9,
+    Code::Space, Code::Enter, Code::Backspace, Code::Tab, Code::Escape, Code::CapsLock,
+    Code::ContextMenu, Code::ScrollLock, Code::Pause, Code::PrintScreen,
+    Code::Insert, Code::Delete, Code::Home, Code::End, Code::PageUp, Code::PageDown,
+    Code::ArrowUp, Code::ArrowDown, Code::ArrowLeft, Code::ArrowRight,
+    Code::ShiftLeft, Code::ShiftRight, Code::ControlLeft, Code::ControlRight,
+    Code::AltLeft, Code::AltRight, Code::MetaLeft, Code::MetaRight,
+    Code::Backquote, Code::Minus, Code::Equal, Code::BracketLeft, Code::BracketRight,
+    Code::Backslash, Code::Semicolon, Code::Quote, Code::Comma, Code::Period, Code::Slash,
+    Code::IntlBackslash, Code::IntlRo, Code::IntlYen,
+    Code::Numpad0, Code::Numpad1, Code::Numpad2, Code::Numpad3, Code::Numpad4, Code::Numpad5,
+    Code::Numpad6, Code::Numpad7, Code::Numpad8, Code::Numpad9, Code::NumpadAdd,
+    Code::NumpadSubtract, Code::NumpadMultiply, Code::NumpadDivide, Code::NumpadDecimal,
+    Code::NumpadEnter, Code::NumpadEqual,
+    Code::MediaPlayPause, Code::MediaStop, Code::MediaTrackNext, Code::MediaTrackPrevious,
+    Code::AudioVolumeUp, Code::AudioVolumeDown, Code::AudioVolumeMute,
+    Code::BrowserBack, Code::BrowserForward, Code::BrowserRefresh, Code::BrowserHome,
+    Code::BrowserFavorites, Code::BrowserSearch,
+];
+
+/// Active "press any key" binding session.
+struct HotkeyBinder {
+    /// When the bind window closes and the previous hotkey is restored.
+    deadline: Instant,
+    /// Temporarily registered keys; the OS eats their presses while bound.
+    temp: Vec<(HotKey, Code)>,
+}
 
 pub struct QAutoClickApp {
     config: ClickerConfig,
@@ -21,8 +65,8 @@ pub struct QAutoClickApp {
     last_error: Option<String>,
     hotkey_manager: Option<GlobalHotKeyManager>,
     hotkey: HotKey,
-    hotkey_id: Arc<AtomicU32>,
     hotkey_error: Option<String>,
+    binder: Option<HotkeyBinder>,
 }
 
 impl QAutoClickApp {
@@ -33,24 +77,12 @@ impl QAutoClickApp {
         status_rx: Receiver<EngineStatus>,
         engine: Option<JoinHandle<()>>,
         running: Arc<AtomicBool>,
-        hotkey_id: Arc<AtomicU32>,
+        _hotkey_id: Arc<AtomicU32>,
     ) -> Self {
         cc.egui_ctx.set_visuals(egui::Visuals::dark());
-        spawn_hotkey_watcher(running.clone(), hotkey_id.clone(), cmd_tx.clone(), cc.egui_ctx.clone());
 
-        let (hotkey_manager, hotkey, hotkey_error) = match GlobalHotKeyManager::new() {
-            Ok(manager) => {
-                let hotkey = hotkey_for(config.hotkey_fkey);
-                match manager.register(hotkey) {
-                    Ok(()) => (Some(manager), hotkey, None),
-                    Err(e) => (Some(manager), hotkey, Some(format!("hotkey registration failed: {e}"))),
-                }
-            }
-            Err(e) => (None, hotkey_for(config.hotkey_fkey), Some(format!("global hotkeys unavailable: {e}"))),
-        };
-        hotkey_id.store(hotkey.id(), Ordering::SeqCst);
-
-        Self {
+        let hotkey_manager = GlobalHotKeyManager::new().ok();
+        let mut app = Self {
             config,
             cmd_tx,
             status_rx,
@@ -59,10 +91,12 @@ impl QAutoClickApp {
             clicks_done: 0,
             last_error: None,
             hotkey_manager,
-            hotkey,
-            hotkey_id,
-            hotkey_error,
-        }
+            hotkey: HotKey::new(None, Code::F6),
+            hotkey_error: None,
+            binder: None,
+        };
+        app.register_active_hotkey();
+        app
     }
 
     fn poll_status(&mut self) {
@@ -84,7 +118,37 @@ impl QAutoClickApp {
         }
     }
 
-    /// Flip running state and tell the engine. Used by both the UI button and the hotkey watcher.
+    /// Drain global hotkey events: toggles the clicker normally, captures
+    /// the pressed key while a bind session is open.
+    fn poll_events(&mut self) {
+        let receiver = GlobalHotKeyEvent::receiver();
+        while let Ok(event) = receiver.try_recv() {
+            if event.state() != HotKeyState::Pressed {
+                continue;
+            }
+            let captured = self
+                .binder
+                .as_ref()
+                .and_then(|binder| binder.temp.iter().find(|(hotkey, _)| hotkey.id() == event.id))
+                .map(|(_, code)| *code);
+            if let Some(code) = captured {
+                self.finish_binding(code);
+                break; // binder state changed; the rest of the queue is safe to handle next frame
+            }
+            if self.binder.is_none() && event.id == self.hotkey.id() {
+                self.toggle();
+            }
+        }
+        let expired = self
+            .binder
+            .as_ref()
+            .is_some_and(|binder| Instant::now() >= binder.deadline);
+        if expired {
+            self.cancel_binding();
+        }
+    }
+
+    /// Flip running state and tell the engine.
     fn toggle(&mut self) {
         let was_running = self.running.fetch_xor(true, Ordering::SeqCst);
         let cmd = if was_running { EngineCommand::Stop } else { EngineCommand::Start };
@@ -96,18 +160,69 @@ impl QAutoClickApp {
         let _ = self.cmd_tx.send(EngineCommand::SetConfig(self.config.clone()));
     }
 
-    fn reregister_hotkey(&mut self) {
-        self.hotkey_error = None;
-        let Some(manager) = &self.hotkey_manager else {
+    /// Open a bind window: grab every bindable key system-wide for 5 seconds.
+    fn start_binding(&mut self) {
+        let Some(manager) = self.hotkey_manager.as_ref() else {
+            self.hotkey_error = Some("global hotkeys unavailable — cannot bind".to_owned());
             return;
         };
+        // The currently active key joins the grab so it can be re-bound or replaced.
         let _ = manager.unregister(self.hotkey);
-        let hotkey = hotkey_for(self.config.hotkey_fkey);
-        match manager.register(hotkey) {
-            Ok(()) => {
-                self.hotkey = hotkey;
-                self.hotkey_id.store(hotkey.id(), Ordering::SeqCst);
+        let mut temp = Vec::new();
+        for code in BINDABLE_CODES {
+            let hotkey = HotKey::new(None, *code);
+            if manager.register(hotkey).is_ok() {
+                temp.push((hotkey, *code));
             }
+        }
+        self.hotkey_error = None;
+        self.binder = Some(HotkeyBinder {
+            deadline: Instant::now() + BIND_TIMEOUT,
+            temp,
+        });
+    }
+
+    /// Close the bind window without changing the hotkey.
+    fn cancel_binding(&mut self) {
+        let Some(binder) = self.binder.take() else {
+            return;
+        };
+        if let Some(manager) = self.hotkey_manager.as_ref() {
+            let hotkeys: Vec<HotKey> = binder.temp.into_iter().map(|(hotkey, _)| hotkey).collect();
+            let _ = manager.unregister_all(&hotkeys);
+        }
+        self.register_active_hotkey();
+    }
+
+    /// Close the bind window, making `code` the new toggle hotkey.
+    fn finish_binding(&mut self, code: Code) {
+        if let Some(binder) = self.binder.take() {
+            if let Some(manager) = self.hotkey_manager.as_ref() {
+                let hotkeys: Vec<HotKey> = binder.temp.into_iter().map(|(hotkey, _)| hotkey).collect();
+                let _ = manager.unregister_all(&hotkeys);
+            }
+        }
+        self.config.hotkey_code = code.to_string();
+        self.register_active_hotkey();
+        self.on_config_changed();
+    }
+
+    /// (Re-)register the hotkey stored in the config.
+    fn register_active_hotkey(&mut self) {
+        self.hotkey_error = None;
+        let Some(manager) = self.hotkey_manager.as_ref() else {
+            return;
+        };
+        let code = match Code::from_str(&self.config.hotkey_code) {
+            Ok(code) => code,
+            Err(_) => {
+                self.hotkey_error = Some(format!("unknown key: {}", self.config.hotkey_code));
+                return;
+            }
+        };
+        let hotkey = HotKey::new(None, code);
+        match manager.register(hotkey) {
+            Ok(()) => self.hotkey = hotkey,
             Err(e) => self.hotkey_error = Some(format!("hotkey registration failed: {e}")),
         }
     }
@@ -124,12 +239,14 @@ impl Drop for QAutoClickApp {
 
 impl eframe::App for QAutoClickApp {
     fn logic(&mut self, _ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Called even while the window is hidden: keep engine state fresh.
+        // Called even while the window is hidden: keep engine and hotkey state fresh.
         self.poll_status();
+        self.poll_events();
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.poll_status();
+        self.poll_events();
 
         egui::Frame::new().inner_margin(egui::Margin::same(14)).show(ui, |ui| {
             let is_running = self.running.load(Ordering::SeqCst);
@@ -154,7 +271,7 @@ impl eframe::App for QAutoClickApp {
                     if ui
                         .add(
                             egui::DragValue::new(&mut self.config.interval_ms)
-                                .range(1..=3_600_000)
+                                .range(0.001..=3_600_000.0)
                                 .speed(10)
                                 .suffix(" ms"),
                         )
@@ -162,7 +279,7 @@ impl eframe::App for QAutoClickApp {
                     {
                         self.on_config_changed();
                     }
-                    ui.weak(format!("≈ {:.1}/s", 1000.0 / self.config.interval_ms.max(1) as f32));
+                    ui.weak(format!("≈ {:.0}/s", 1000.0 / self.config.interval_ms.max(0.001)));
                 });
                 ui.end_row();
 
@@ -206,22 +323,33 @@ impl eframe::App for QAutoClickApp {
 
                 ui.label("Toggle hotkey");
                 ui.horizontal(|ui| {
-                    let combo = egui::ComboBox::from_id_salt("hotkey_fkey")
-                        .selected_text(format!("F{}", self.config.hotkey_fkey))
-                        .show_ui(ui, |ui| {
-                            for fkey in 1..=12u8 {
-                                ui.selectable_value(&mut self.config.hotkey_fkey, fkey, format!("F{fkey}"));
-                            }
-                        });
-                    if combo.response.changed() {
-                        self.reregister_hotkey();
-                        self.on_config_changed();
+                    let binding = self.binder.is_some();
+                    if binding {
+                        let remaining = self
+                            .binder
+                            .as_ref()
+                            .map_or(0.0, |b| (b.deadline - Instant::now()).as_secs_f32().max(0.0));
+                        if ui.button(format!("Cancel ({remaining:.1}s)")).clicked() {
+                            self.cancel_binding();
+                        }
+                        ui.colored_label(egui::Color32::LIGHT_BLUE, "Press any key…");
+                    } else {
+                        ui.monospace(pretty_key(&self.config.hotkey_code));
+                        if ui.button("Bind").clicked() {
+                            self.start_binding();
+                        }
+                        ui.weak("(system-wide)");
                     }
-                    ui.weak("(system-wide)");
                 });
                 ui.end_row();
             });
 
+            if self.config.interval_ms < 1.0 {
+                ui.colored_label(
+                    egui::Color32::YELLOW,
+                    "⚠ Interval below 1 ms — high CPU load possible",
+                );
+            }
             if let Some(error) = &self.hotkey_error {
                 ui.colored_label(egui::Color32::YELLOW, error);
             }
@@ -256,49 +384,51 @@ impl eframe::App for QAutoClickApp {
             }
         });
 
-        if self.running.load(Ordering::SeqCst) {
-            ui.ctx().request_repaint_after(Duration::from_millis(50));
-        }
+        // Keep polling engine status and global hotkeys even when idle/unfocused,
+        // and keep the bind countdown ticking.
+        let repaint = if self.binder.is_some() || self.running.load(Ordering::SeqCst) {
+            Duration::from_millis(50)
+        } else {
+            Duration::from_millis(100)
+        };
+        ui.ctx().request_repaint_after(repaint);
     }
 }
 
-/// Map F-key number to a global hotkey.
-fn hotkey_for(fkey: u8) -> HotKey {
-    let code = match fkey {
-        1 => Code::F1,
-        2 => Code::F2,
-        3 => Code::F3,
-        4 => Code::F4,
-        5 => Code::F5,
-        6 => Code::F6,
-        7 => Code::F7,
-        8 => Code::F8,
-        9 => Code::F9,
-        10 => Code::F10,
-        11 => Code::F11,
-        _ => Code::F12,
-    };
-    HotKey::new(None, code)
-}
-
-/// Background thread translating global hotkey presses into engine commands.
-/// Runs even when the window is unfocused; wakes the UI on every toggle.
-fn spawn_hotkey_watcher(
-    running: Arc<AtomicBool>,
-    hotkey_id: Arc<AtomicU32>,
-    cmd_tx: Sender<EngineCommand>,
-    ctx: egui::Context,
-) {
-    std::thread::spawn(move || {
-        let receiver = GlobalHotKeyEvent::receiver();
-        while let Ok(event) = receiver.recv() {
-            if event.state() != HotKeyState::Pressed || event.id() != hotkey_id.load(Ordering::SeqCst) {
-                continue;
-            }
-            let was_running = running.fetch_xor(true, Ordering::SeqCst);
-            let cmd = if was_running { EngineCommand::Stop } else { EngineCommand::Start };
-            let _ = cmd_tx.send(cmd);
-            ctx.request_repaint();
+/// Human-friendly name for a `keyboard_types::Code` name ("KeyA" → "A").
+fn pretty_key(code_name: &str) -> String {
+    if let Some(letter) = code_name.strip_prefix("Key") {
+        if letter.len() == 1 {
+            return letter.to_ascii_uppercase();
         }
-    });
+    }
+    if let Some(digit) = code_name.strip_prefix("Digit") {
+        return digit.to_owned();
+    }
+    match code_name {
+        "Minus" => "-".into(),
+        "Equal" => "=".into(),
+        "Comma" => ",".into(),
+        "Period" => ".".into(),
+        "Slash" => "/".into(),
+        "Semicolon" => ";".into(),
+        "Quote" => "'".into(),
+        "Backquote" => "`".into(),
+        "Backslash" => "\\".into(),
+        "BracketLeft" => "[".into(),
+        "BracketRight" => "]".into(),
+        "ShiftLeft" => "L Shift".into(),
+        "ShiftRight" => "R Shift".into(),
+        "ControlLeft" => "L Ctrl".into(),
+        "ControlRight" => "R Ctrl".into(),
+        "AltLeft" => "L Alt".into(),
+        "AltRight" => "R Alt".into(),
+        "MetaLeft" => "L Win".into(),
+        "MetaRight" => "R Win".into(),
+        "ArrowUp" => "Up".into(),
+        "ArrowDown" => "Down".into(),
+        "ArrowLeft" => "Left".into(),
+        "ArrowRight" => "Right".into(),
+        other => other.to_owned(),
+    }
 }
