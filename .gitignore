@@ -1,0 +1,9 @@
+# Rust build artifacts
+/target/
+
+# IDE / editor noise
+.idea/
+*.iml
+.vscode/
+.DS_Store
+Thumbs.db
