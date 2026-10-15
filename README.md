@@ -51,4 +51,4 @@ cargo test
 
 ## License
 
-See [LICENSE](LICENSE).
+See [LICENSE](LICENSE.md).
